@@ -1,0 +1,4 @@
+.venv/
+.browser_profile/
+output/
+__pycache__/
