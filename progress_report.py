@@ -7,6 +7,7 @@ Usage:
 """
 
 import csv
+import re
 import sys
 from collections import Counter, defaultdict
 from datetime import date
@@ -21,6 +22,9 @@ SNAPSHOT_DIR = ROOT / "output" / "snapshots"
 REPORT_DIR = ROOT / "output" / "reports"
 
 SNAPSHOT_HEADER = ["College Name", "Section Code", "Display Name", "Done", "Status"]
+
+GENDER_SEPARATOR = re.compile(r"[_\s-]+")
+GENDER_PART = re.compile(r"\d*(FEMALE|MALE|F|M)\d*")
 
 HEADER_FONT = Font(bold=True, color="FFFFFF")
 HEADER_FILL = PatternFill("solid", fgColor="305496")
@@ -84,6 +88,15 @@ def index_students(rows):
     return sections
 
 
+def gender(display_name):
+    """Read gender from the M/F part of a display name: GBIC_12_F_169, MDJ_09M_001, GHSRG_09_F001."""
+    for part in GENDER_SEPARATOR.split(display_name.upper()):
+        match = GENDER_PART.fullmatch(part)
+        if match:
+            return "Female" if match.group(1).startswith("F") else "Male"
+    return ""
+
+
 def describe_change(previous, current):
     if previous is None:
         return "New student"
@@ -115,14 +128,16 @@ def compare(today_rows, previous_rows):
             earlier = earlier_students.get(key) if earlier_students is not None else None
             change = describe_change(earlier, current) if earlier_students is not None else ""
             section_changes[change] += 1
-            row = (college, code, key[0], *current, *(earlier or ("", "")), change)
+            row = (college, code, key[0], gender(key[0]), *current, *(earlier or ("", "")), change)
             students.append(row)
             if change:
                 changes.append(row)
         for key, earlier in (earlier_students or {}).items():
             if key not in current_students:
                 section_changes["Removed student"] += 1
-                changes.append((college, code, key[0], "", "", *earlier, "Removed student"))
+                changes.append(
+                    (college, code, key[0], gender(key[0]), "", "", *earlier, "Removed student")
+                )
 
         if earlier_students is None:
             done_before = newly_done = change_in_done = None
@@ -243,19 +258,21 @@ def build_report(day, today_rows, compared_day=None, previous_rows=None):
         "College Name",
         "Section Code",
         "Display Name",
+        "Gender",
         "Done",
         "Status",
         "Previous Done",
         "Previous Status",
         "Change",
     ]
+    change_column = len(student_header)
     change_sheet = workbook.create_sheet("Changes")
     add_table(change_sheet, student_header, changes)
-    colour_changes(change_sheet, 8, 2, len(changes))
+    colour_changes(change_sheet, change_column, 2, len(changes))
 
     student_sheet = workbook.create_sheet("All Students")
     add_table(student_sheet, student_header, students)
-    colour_changes(student_sheet, 8, 2, len(students))
+    colour_changes(student_sheet, change_column, 2, len(students))
 
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
     path = REPORT_DIR / f"{day.isoformat()}.xlsx"
