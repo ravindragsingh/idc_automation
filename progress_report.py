@@ -21,10 +21,10 @@ ROOT = Path(__file__).parent
 SNAPSHOT_DIR = ROOT / "output" / "snapshots"
 REPORT_DIR = ROOT / "output" / "reports"
 
-SNAPSHOT_HEADER = ["College Name", "Section Code", "Display Name", "Done", "Status"]
+SNAPSHOT_HEADER = ["College Name", "Section Code", "Display Name", "Done", "Status", "Course"]
 
 GENDER_SEPARATOR = re.compile(r"[_\s-]+")
-GENDER_PART = re.compile(r"\d*(FEMALE|MALE|F|M)\d*")
+GENDER_PART = re.compile(r"(?:[A-Z]*\d+)?(FEMALE|MALE|F|M)\d*")
 
 HEADER_FONT = Font(bold=True, color="FFFFFF")
 HEADER_FILL = PatternFill("solid", fgColor="305496")
@@ -35,6 +35,10 @@ CHANGE_FILLS = {
     "Status changed": PatternFill("solid", fgColor="FFEB9C"),
     "New student": PatternFill("solid", fgColor="DDEBF7"),
     "Removed student": PatternFill("solid", fgColor="D9D9D9"),
+}
+COURSE_FILLS = {
+    "AI for Oceans": PatternFill("solid", fgColor="DDEBF7"),
+    "How AI Makes Decisions": PatternFill("solid", fgColor="FCE4D6"),
 }
 
 
@@ -54,7 +58,11 @@ def write_snapshot(day, rows):
 
 def read_snapshot(path):
     with path.open(newline="", encoding="utf-8-sig") as file:
-        return [tuple(row[column] for column in SNAPSHOT_HEADER) for row in csv.DictReader(file)]
+        # Snapshots from before the Course column existed read it as blank.
+        return [
+            tuple(row.get(column) or "" for column in SNAPSHOT_HEADER)
+            for row in csv.DictReader(file)
+        ]
 
 
 def snapshot_days():
@@ -82,14 +90,17 @@ def index_students(rows):
     """
     sections = defaultdict(dict)
     seen = Counter()
-    for _, code, name, done, status in rows:
+    for _, code, name, done, status, _ in rows:
         seen[code, name] += 1
         sections[code][name, seen[code, name]] = (done, status)
     return sections
 
 
 def gender(display_name):
-    """Read gender from the M/F part of a display name: GBIC_12_F_169, MDJ_09M_001, GHSRG_09_F001."""
+    """Read gender from the M/F part of a display name.
+
+    Handles GBIC_12_F_169, MDJ_09M_001, GHSRG_09_F001 and GMSSSS_GTR9M_001.
+    """
     for part in GENDER_SEPARATOR.split(display_name.upper()):
         match = GENDER_PART.fullmatch(part)
         if match:
@@ -114,9 +125,12 @@ def compare(today_rows, previous_rows):
     today = index_students(today_rows)
     previous = index_students(previous_rows) if previous_rows is not None else {}
     college_names = {code: name for name, code, *_ in today_rows}
+    courses = {row[1]: row[5] for row in previous_rows or []}
+    courses.update({row[1]: row[5] for row in today_rows})
 
     summary, changes, students = [], [], []
     for code, college in college_names.items():
+        course = courses[code]
         current_students = today[code]
         # A section missing from the previous snapshot has nothing to compare against.
         earlier_students = previous.get(code)
@@ -128,7 +142,16 @@ def compare(today_rows, previous_rows):
             earlier = earlier_students.get(key) if earlier_students is not None else None
             change = describe_change(earlier, current) if earlier_students is not None else ""
             section_changes[change] += 1
-            row = (college, code, key[0], gender(key[0]), *current, *(earlier or ("", "")), change)
+            row = (
+                college,
+                code,
+                course,
+                key[0],
+                gender(key[0]),
+                *current,
+                *(earlier or ("", "")),
+                change,
+            )
             students.append(row)
             if change:
                 changes.append(row)
@@ -136,7 +159,7 @@ def compare(today_rows, previous_rows):
             if key not in current_students:
                 section_changes["Removed student"] += 1
                 changes.append(
-                    (college, code, key[0], gender(key[0]), "", "", *earlier, "Removed student")
+                    (college, code, course, key[0], gender(key[0]), "", "", *earlier, "Removed student")
                 )
 
         if earlier_students is None:
@@ -149,6 +172,7 @@ def compare(today_rows, previous_rows):
             (
                 college,
                 code,
+                course,
                 total,
                 done,
                 total - done,
@@ -166,7 +190,7 @@ def compare(today_rows, previous_rows):
         if code not in today:
             college = next(name for name, other, *_ in previous_rows if other == code)
             done_before = sum(1 for done, _ in earlier_students.values() if done == "Yes")
-            missing.append((college, code, len(earlier_students), done_before))
+            missing.append((college, code, courses[code], len(earlier_students), done_before))
     return summary, changes, students, missing
 
 
@@ -187,6 +211,21 @@ def add_table(sheet, header, rows, first_row=1):
     for column, title in enumerate(header, start=1):
         longest = max([len(str(title))] + [len(str(row[column - 1] or "")) for row in rows])
         sheet.column_dimensions[get_column_letter(column)].width = min(max(longest + 2, 10), 60)
+
+
+def write_total(sheet, row_number, label, rows):
+    """Write a bold total row over Summary rows (Students through Removed Students)."""
+    sheet.cell(row=row_number, column=1, value=label)
+    for column in (4, 5, 6, 8, 9, 10, 11, 12):
+        values = [row[column - 1] for row in rows if row[column - 1] is not None]
+        if values or column <= 6:
+            sheet.cell(row=row_number, column=column, value=sum(values))
+    students = sum(row[3] for row in rows)
+    sheet.cell(
+        row=row_number, column=7, value=sum(row[4] for row in rows) / students if students else 0
+    )
+    for column in range(1, 13):
+        sheet.cell(row=row_number, column=column).font = TOTAL_FONT
 
 
 def colour_changes(sheet, change_column, first_row, row_count):
@@ -213,6 +252,7 @@ def build_report(day, today_rows, compared_day=None, previous_rows=None):
     header = [
         "College Name",
         "Section Code",
+        "Course",
         "Students",
         f"Done {day}",
         "Not Done",
@@ -224,20 +264,19 @@ def build_report(day, today_rows, compared_day=None, previous_rows=None):
         "Removed Students",
     ]
     add_table(sheet, header, summary, first_row=4)
+    for row in range(5, 5 + len(summary)):
+        fill = COURSE_FILLS.get(sheet.cell(row=row, column=3).value)
+        if fill:
+            sheet.cell(row=row, column=3).fill = fill
+
     total_row = 5 + len(summary)
-    sheet.cell(row=total_row, column=1, value="Total")
-    for column in (3, 4, 5, 7, 8, 9, 10, 11):
-        values = [row[column - 1] for row in summary if row[column - 1] is not None]
-        if values or column <= 5:
-            sheet.cell(row=total_row, column=column, value=sum(values))
-    all_students = sum(row[2] for row in summary)
-    sheet.cell(
-        row=total_row, column=6, value=sum(row[3] for row in summary) / all_students if all_students else 0
-    )
-    for column in range(1, len(header) + 1):
-        sheet.cell(row=total_row, column=column).font = TOTAL_FONT
+    for course in sorted({row[2] for row in summary if row[2]}):
+        write_total(sheet, total_row, f"Total {course}", [row for row in summary if row[2] == course])
+        sheet.cell(row=total_row, column=3, value=course).fill = COURSE_FILLS.get(course, PatternFill())
+        total_row += 1
+    write_total(sheet, total_row, "Total", summary)
     for row in range(5, total_row + 1):
-        sheet.cell(row=row, column=6).number_format = "0%"
+        sheet.cell(row=row, column=7).number_format = "0%"
 
     if missing:
         note_row = total_row + 2
@@ -247,7 +286,7 @@ def build_report(day, today_rows, compared_day=None, previous_rows=None):
             value=f"In the {compared_day} snapshot but not captured on {day} (not in the totals above)",
         ).font = TOTAL_FONT
         for column, title in enumerate(
-            ["College Name", "Section Code", "Students", before], start=1
+            ["College Name", "Section Code", "Course", "Students", before], start=1
         ):
             sheet.cell(row=note_row + 1, column=column, value=title).font = TOTAL_FONT
         for offset, row in enumerate(missing, start=2):
@@ -257,6 +296,7 @@ def build_report(day, today_rows, compared_day=None, previous_rows=None):
     student_header = [
         "College Name",
         "Section Code",
+        "Course",
         "Display Name",
         "Gender",
         "Done",

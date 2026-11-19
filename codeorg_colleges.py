@@ -73,8 +73,13 @@ READ_TABLE_JS = """() => {
 }""" % STUDENT_ROWS
 
 
+def course_of(section):
+    """The course assigned to a section, e.g. "AI for Oceans"."""
+    return (section.get("assignedTitle") or "").strip()
+
+
 def required_lessons(section):
-    return REQUIRED_LESSONS.get((section.get("assignedTitle") or "").strip().lower(), (1,))
+    return REQUIRED_LESSONS.get(course_of(section).lower(), (1,))
 
 
 def matches_rule(rows, lessons):
@@ -281,7 +286,7 @@ def main():
                     and matches_rule(earlier, required_lessons(section))
                 ):
                     print(f"      skipped: all {len(earlier)} students done on {complete_day}")
-                    rows += [(section["name"], *row[1:]) for row in earlier]
+                    rows += [(section["name"], *row[1:5], course_of(section)) for row in earlier]
                     skipped += 1
                     continue
                 students = None
@@ -299,7 +304,14 @@ def main():
                 print(f"      {len(students)} students, {done} done")
                 for name, is_done, status in students:
                     rows.append(
-                        (section["name"], section["code"], name, "Yes" if is_done else "No", status)
+                        (
+                            section["name"],
+                            section["code"],
+                            name,
+                            "Yes" if is_done else "No",
+                            status,
+                            course_of(section),
+                        )
                     )
 
             progress_path = OUTPUT_DIR / "progress.csv"
