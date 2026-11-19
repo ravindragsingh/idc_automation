@@ -10,6 +10,10 @@ session is stored in .browser_profile/, so later runs skip the login step.
 Usage:
     python codeorg_colleges.py                    # every college
     python codeorg_colleges.py --section "Agra"   # only colleges whose name matches
+    python codeorg_colleges.py --full             # also re-open colleges already 100% done
+
+Colleges that were 100% done in the newest snapshot, and still have the same number
+of students, are not opened again; their rows are copied from that snapshot.
 
 Writes output/colleges.csv (name + section code) and output/progress.csv. A full
 run also saves output/snapshots/progress_<date>.csv and an Excel report comparing
@@ -173,10 +177,30 @@ def write_csv(path, header, rows):
         writer.writerows(rows)
 
 
+def completed_sections():
+    """Return ({section code: snapshot rows}, snapshot date) for colleges 100% done in the newest snapshot.
+
+    Students do not lose a finished lesson, so these colleges need not be opened again.
+    """
+    days = progress_report.snapshot_days()
+    if not days:
+        return {}, None
+    by_section = {}
+    for row in progress_report.read_snapshot(progress_report.snapshot_path(days[-1])):
+        by_section.setdefault(row[1], []).append(row)
+    complete = {
+        code: rows for code, rows in by_section.items() if all(row[3] == "Yes" for row in rows)
+    }
+    return complete, days[-1]
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument(
         "--section", help="only colleges whose name matches this case-insensitive regex"
+    )
+    parser.add_argument(
+        "--full", action="store_true", help="also re-read colleges that were already 100%% done"
     )
     args = parser.parse_args()
     print(f"Run started {datetime.now():%Y-%m-%d %H:%M}")
@@ -197,21 +221,33 @@ def main():
                 pattern = re.compile(args.section, re.I)
                 sections = [section for section in sections if pattern.search(section["name"])]
             print(f"Found {len(sections)} colleges.")
+            complete, complete_day = ({}, None) if args.full else completed_sections()
 
             rows = []
             failed = []
+            skipped = 0
             for index, section in enumerate(sections, start=1):
+                if page.is_closed():
+                    print("The browser window was closed; stopping.")
+                    failed.extend(sections[index - 1 :])
+                    break
                 print(f"  [{index}/{len(sections)}] {section['name']} ({section['code']})")
+                earlier = complete.get(section["code"])
+                if earlier and len(earlier) == section.get("numberOfStudents"):
+                    print(f"      skipped: all {len(earlier)} students done on {complete_day}")
+                    rows += [(section["name"], *row[1:]) for row in earlier]
+                    skipped += 1
+                    continue
                 students = None
                 for _ in range(2):
                     try:
                         students = read_progress(page, section)
                     except PlaywrightError as error:
                         print(f"      failed: {error}")
-                    if students is not None:
+                    if students is not None or page.is_closed():
                         break
                 if students is None:
-                    failed.append(section["name"])
+                    failed.append(section)
                     continue
                 done = sum(1 for _, status in students if status)
                 print(f"      {len(students)} students, {done} done")
@@ -223,12 +259,26 @@ def main():
             progress_path = OUTPUT_DIR / "progress.csv"
             write_csv(progress_path, progress_report.SNAPSHOT_HEADER, rows)
             print(f"Saved {len(rows)} students to {progress_path}")
+            if skipped:
+                print(f"Skipped {skipped} colleges that were already 100% done")
             if failed:
-                print(f"Failed colleges ({len(failed)}): {', '.join(failed)}")
+                names = ", ".join(section["name"] for section in failed)
+                print(f"Failed colleges ({len(failed)}): {names}")
 
             # A filtered run is not a full day's snapshot, so it is left out of the comparison.
             if not args.section and rows:
                 today = date.today()
+                snapshot = progress_report.snapshot_path(today)
+                if failed and snapshot.exists():
+                    # Keep an earlier run's data for the colleges this run could not read.
+                    failed_codes = {section["code"] for section in failed}
+                    kept = [
+                        row
+                        for row in progress_report.read_snapshot(snapshot)
+                        if row[1] in failed_codes
+                    ]
+                    rows += kept
+                    print(f"Kept {len(kept)} students from today's earlier run for failed colleges")
                 progress_report.write_snapshot(today, rows)
                 print(f"Saved report to {progress_report.build_report_for(today)}")
             return 1 if failed else 0
