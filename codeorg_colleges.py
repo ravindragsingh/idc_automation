@@ -12,6 +12,9 @@ Usage:
     python codeorg_colleges.py --section "Agra"   # only colleges whose name matches
     python codeorg_colleges.py --full             # also re-open colleges already 100% done
 
+A student counts as done when lesson 1 is filled in, except in "How AI Makes
+Decisions", which needs lessons 2 and 3 (see REQUIRED_LESSONS).
+
 Colleges that were 100% done in the newest snapshot, and still have the same number
 of students, are not opened again; their rows are copied from that snapshot.
 
@@ -46,20 +49,40 @@ TABLE_TIMEOUT_MS = 90 * 1000
 
 STUDENT_ROWS = '#ui-test-progress-table-v2 button[id^="ui-test-student-row"]'
 
+# Lessons that must all be filled in for a student to count as done, by course
+# name as code.org reports it. Any other course uses lesson 1 (AI for Oceans has only one).
+REQUIRED_LESSONS = {"how ai makes decisions": (2, 3)}
+
 # Student names and lesson cells are separate columns, matched up by position.
-# A cell is "lesson-data-cell-<lessonId>-<studentId>"; only the first lesson is read.
+# A cell is "lesson-data-cell-<lessonId>-<studentId>"; the lesson columns appear in
+# lesson order (1, 2, 3, ...), so `lessons` holds one list of statuses per lesson.
 READ_TABLE_JS = """() => {
     const names = [...document.querySelectorAll('%s')].map(b => b.innerText.trim());
     const cells = [...document.querySelectorAll('[data-testid^="lesson-data-cell-"]')];
-    const lessonOf = cell => cell.dataset.testid.split('-')[3];
-    const lessons = [...new Set(cells.map(lessonOf))];
-    const statuses = cells.filter(cell => lessonOf(cell) === lessons[0]).map(cell => {
+    const byLesson = new Map();
+    for (const cell of cells) {
+        const lesson = cell.dataset.testid.split('-')[3];
+        if (!byLesson.has(lesson)) byLesson.set(lesson, []);
         const labelled = cell.querySelector('[aria-label]');
-        if (labelled) return labelled.getAttribute('aria-label');
-        return cell.querySelector('i, svg') || cell.innerText.trim() ? 'Yes' : '';
-    });
-    return {names, statuses, lessons: lessons.length};
+        byLesson.get(lesson).push(
+            labelled ? labelled.getAttribute('aria-label')
+                : cell.querySelector('i, svg') || cell.innerText.trim() ? 'Yes' : ''
+        );
+    }
+    return {names, lessons: [...byLesson.values()]};
 }""" % STUDENT_ROWS
+
+
+def required_lessons(section):
+    return REQUIRED_LESSONS.get((section.get("assignedTitle") or "").strip().lower(), (1,))
+
+
+def matches_rule(rows, lessons):
+    """Whether snapshot rows were recorded with the section's current lesson rule.
+
+    Snapshots taken before a course had its own rule recorded only lesson 1.
+    """
+    return lessons == (1,) or all(row[4].startswith(f"L{lessons[0]} ") for row in rows)
 
 
 def launch(playwright):
@@ -133,7 +156,7 @@ def fetch_sections(page):
 
 
 def read_progress(page, section):
-    """Open a section's progress page and return [(display name, status)], or None on failure."""
+    """Open a section's progress page and return [(display name, done, status)], or None on failure."""
     expected = section.get("numberOfStudents") or 0
     page.goto(section["linkToProgress"], wait_until="domcontentloaded")
     if expected == 0:
@@ -155,19 +178,38 @@ def read_progress(page, section):
     for _ in range(15):
         page.wait_for_timeout(2000)
         latest = page.evaluate(READ_TABLE_JS)
-        if latest == table and len(latest["names"]) == len(latest["statuses"]):
+        if latest == table and complete_table(latest):
             break
         table = latest
 
-    names, statuses = table["names"], table["statuses"]
-    if not names or len(names) != len(statuses):
-        print(f"      could not read table: {len(names)} students, {len(statuses)} lesson cells")
+    names, columns = table["names"], table["lessons"]
+    if not complete_table(table):
+        counts = ", ".join(str(len(column)) for column in columns) or "no"
+        print(f"      could not read table: {len(names)} students, {counts} lesson cells")
         return None
     if len(names) != expected:
         print(f"      warning: section lists {expected} students, table shows {len(names)}")
-    if table["lessons"] > 1:
-        print(f"      warning: {table['lessons']} lessons shown, only the first is recorded")
-    return list(zip(names, statuses))
+
+    lessons = required_lessons(section)
+    if max(lessons) > len(columns):
+        print(f"      could not read table: needs lesson {max(lessons)}, page shows {len(columns)}")
+        return None
+    if lessons == (1,):
+        return [(name, bool(status), status) for name, status in zip(names, columns[0])]
+
+    students = []
+    for index, name in enumerate(names):
+        statuses = [(number, columns[number - 1][index]) for number in lessons]
+        summary = ", ".join(f"L{number} {status}" for number, status in statuses if status)
+        students.append((name, all(status for _, status in statuses), summary))
+    return students
+
+
+def complete_table(table):
+    names = table["names"]
+    return bool(names) and bool(table["lessons"]) and all(
+        len(column) == len(names) for column in table["lessons"]
+    )
 
 
 def write_csv(path, header, rows):
@@ -233,7 +275,11 @@ def main():
                     break
                 print(f"  [{index}/{len(sections)}] {section['name']} ({section['code']})")
                 earlier = complete.get(section["code"])
-                if earlier and len(earlier) == section.get("numberOfStudents"):
+                if (
+                    earlier
+                    and len(earlier) == section.get("numberOfStudents")
+                    and matches_rule(earlier, required_lessons(section))
+                ):
                     print(f"      skipped: all {len(earlier)} students done on {complete_day}")
                     rows += [(section["name"], *row[1:]) for row in earlier]
                     skipped += 1
@@ -249,11 +295,11 @@ def main():
                 if students is None:
                     failed.append(section)
                     continue
-                done = sum(1 for _, status in students if status)
+                done = sum(1 for _, is_done, _ in students if is_done)
                 print(f"      {len(students)} students, {done} done")
-                for name, status in students:
+                for name, is_done, status in students:
                     rows.append(
-                        (section["name"], section["code"], name, "Yes" if status else "No", status)
+                        (section["name"], section["code"], name, "Yes" if is_done else "No", status)
                     )
 
             progress_path = OUTPUT_DIR / "progress.csv"
